@@ -18,16 +18,16 @@ typedef struct EntryNode {
 } EntryNode;
 
 typedef struct {
-    size_t num_buckets;
+    size_t num_entries;
     EntryNode **root;
 } KeyDir;
 
 KeyDir* casky_open(const char *path);
-void   casky_close(Casky *db);
+void   casky_close(KeyDir *db);
 
-int    casky_put(Casky *db, const char *key, const char *value);
-char*  casky_get(Casky *db, const char *key);
-int    casky_delete(Casky *db, const char *key);
+int    casky_put(KeyDir *db, const char *key, const char *value);
+char*  casky_get(KeyDir *db, const char *key);
+int    casky_delete(KeyDir *db, const char *key);
 
 #endif
 
