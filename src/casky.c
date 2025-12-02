@@ -3,37 +3,38 @@
 #include <time.h>
 #include <string.h>
 #include "casky.h"
+#include "crc.h"
 #include "utils.h"
 #include "version.h"
 
 CaskyError casky_errno = CASKY_OK;
 
 /**
- * Opens a new casky database or create one if a NULL argument is specified.
- * Returns NULL if the specified path doesn't exist or it is not a file.
+ * Opens a Casky database.
+ *
+ * If the log file exists, reads all records and reconstructs the in-memory
+ * KeyDir. Each record is verified with CRC32.
+ *
+ * If the log file does not exist, creates an empty KeyDir and prepares for
+ * writes. The KeyDir keeps track of the number of entries, buckets, root list,
+ * and the filename for persistence.
+ *
+ * Returns a pointer to a newly allocated KeyDir on success, or NULL on error.
+ * Sets casky_errno appropriately.
  */
 KeyDir* casky_open(const char *path) {
-
   if (!path) {
     casky_errno = CASKY_ERR_INVALID_PATH;
     return NULL;
   }
 
-  if (!casky_is_regular_file(path)) {
-    FILE *f = fopen(path, "wb");
-    if (!f) {
-      casky_errno = CASKY_ERR_IO;
-      return NULL;
-    }
-    fclose(f);
-  }
-
-  KeyDir *kd;
-  kd = malloc(sizeof(KeyDir));
+  KeyDir *kd = malloc(sizeof(KeyDir));
   if (!kd) {
     casky_errno = CASKY_ERR_MEMORY;
     return NULL;
   }
+
+
   kd->num_entries = 0;
   kd->num_buckets = CASKY_INITIAL_BUCKETS_NUM;
   kd->root = calloc(kd->num_buckets, sizeof(EntryNode *));
@@ -43,6 +44,104 @@ KeyDir* casky_open(const char *path) {
     return NULL;
   }
 
+  kd->filename = strdup(path);
+  if (!kd->filename) {
+    free(kd->root);
+    free(kd);
+    casky_errno = CASKY_ERR_MEMORY;
+    return NULL;
+  }
+
+  /**
+   * This flag enables or disables a fsync call in casky_write_data_to_file()
+   * If set to 1 on every fflush() after a disk operation, a fsync() is
+   * performed to ensure data is really pushed out from OS buffers. This have
+   * performance impact but it maximizes the crash tolerance.
+   *
+   * Default: no fsync, preserve performances
+   */
+
+  kd->sync_on_write = 0;
+  FILE *f = fopen(path, "ab+");
+  if (!f) {
+    free(kd->filename);
+    free(kd->root);
+    free(kd);
+    casky_errno = CASKY_ERR_INVALID_PATH;
+    return NULL;
+  }
+
+  // Rewind to start for reading existing records
+  rewind(f);
+
+  while (!feof(f)) {
+    uint32_t crc, timestamp, key_len, value_len;
+
+    if (fread(&crc, sizeof(crc), 1, f) != 1) break;
+    if (fread(&timestamp, sizeof(timestamp), 1, f) != 1) break;
+    if (fread(&key_len, sizeof(key_len), 1, f) != 1) break;
+    if (fread(&value_len, sizeof(value_len), 1, f) != 1) break;
+
+    char *key = malloc(key_len + 1);
+    char *value = value_len > 0 ? malloc(value_len + 1) : NULL;
+
+    if (!key || (value_len > 0 && !value)) {
+      free(key);
+      free(value);
+      continue; // skip invalid record
+    }
+
+    if (fread(key, 1, key_len, f) != key_len) {
+      free(key);
+      free(value);
+      break;
+    }
+    key[key_len] = '\0';
+
+    if (value_len > 0) {
+      if (fread(value, 1, value_len, f) != value_len) {
+        free(key);
+        free(value);
+        break;
+      }
+      value[value_len] = '\0';
+    }
+
+    // Verify CRC
+    size_t buf_len = sizeof(timestamp) + sizeof(key_len) + sizeof(value_len) + key_len + value_len;
+    unsigned char *buf = malloc(buf_len);
+    if (buf) {
+      unsigned char *p = buf;
+      memcpy(p, &timestamp, sizeof(timestamp)); p += sizeof(timestamp);
+      memcpy(p, &key_len, sizeof(key_len)); p += sizeof(key_len);
+      memcpy(p, &value_len, sizeof(value_len)); p += sizeof(value_len);
+      memcpy(p, key, key_len); p += key_len;
+      if (value_len > 0) memcpy(p, value, value_len);
+
+      uint32_t computed_crc = casky_crc32(buf, buf_len);
+      free(buf);
+
+      if (computed_crc != crc) {
+        // skip corrupted record
+        free(key);
+        free(value);
+        continue;
+      }
+    }
+
+    if (value_len > 0) {
+      // PUT record
+      casky_put_in_memory(kd, key, value, timestamp);
+    } else {
+      // DELETE record
+      casky_delete_from_memory(kd, key);
+    }
+
+    free(key);
+    free(value);
+  }
+
+  fclose(f);
   casky_errno = CASKY_OK;
   return kd;
 }
@@ -116,45 +215,22 @@ int casky_put(KeyDir *kd, const char *key, const char *value) {
     casky_errno = CASKY_ERR_INVALID_POINTER;
     return -1;
   }
-
-  unsigned long hash = casky_djb2_hash_xor((unsigned char *)key);
-  size_t bucket_index = hash % kd->num_buckets;
-
-  EntryNode *node = kd->root[bucket_index];
-  EntryNode *prev = NULL;
-
-  // Check if the key exists
-  while (node) {
-    if (strcmp(key, node->entry.key) == 0) {
-      // update value
-      free(node->entry.value);
-      node->entry.value = strdup(value);
-      node->entry.timestamp = time(NULL);
-
-      casky_errno = CASKY_OK;
-      return 0;
-    }
-    prev = node;
-    node = node->next;
+  if (!key || !value) {
+    casky_errno = CASKY_ERR_INVALID_KEY;
+    return -1;
   }
 
-  // Key not  found  here...
-  EntryNode *new_node = calloc(1, sizeof(EntryNode));
-  new_node->entry.key = strdup(key);
-  new_node->entry.value = strdup(value);
-  new_node->entry.timestamp = time(NULL);
-  new_node->next = NULL;
+  uint32_t timestamp = time(NULL);
+  casky_put_in_memory(kd, key, value, timestamp);
 
-  if (prev == NULL) {
-    // empty bucket
-    kd->root[bucket_index] = new_node;
-  } else {
-    prev->next = new_node;
+  // Write record to log file
+  if (casky_write_data_to_file(kd->filename, kd->sync_on_write, key, value, timestamp) != 0) {
+    casky_errno = CASKY_ERR_IO;
+    return -1;
   }
 
-  kd->num_entries++;
   casky_errno = CASKY_OK;
-  return casky_errno;
+  return 0;
 }
 
 /**
@@ -233,34 +309,24 @@ int    casky_delete(KeyDir *kd, const char *key) {
     casky_errno = CASKY_ERR_INVALID_KEY;
     return -1;
   }
-  unsigned long hash = casky_djb2_hash_xor((unsigned char *)key);
-  size_t bucket_index = hash % kd->num_buckets;
 
-  EntryNode *node = kd->root[bucket_index];
-  EntryNode *prev = NULL;
+  // Remove from memory
+  int found = casky_delete_from_memory(kd, key);
+  if (!found) {
+    casky_errno = CASKY_ERR_KEY_NOT_FOUND;
+    return -1;
+  }  
 
-  // Check if the key exists
-  while (node) {
-    if (strcmp(key, node->entry.key) == 0) {
-      // free all the buffers and delete the node
-      if (prev == NULL) 
-        kd->root[bucket_index] = node->next;
-      else 
-        prev->next = node->next;
+  uint32_t timestamp = time(NULL);
 
-      free(node->entry.key);
-      free(node->entry.value);
-      free(node);
-
-      kd->num_entries--;
-      casky_errno = CASKY_OK;
-      return 0;
-    }
-    prev = node;
-    node = node->next;
+  // Append deletion record to log file (value = NULL)
+  if (casky_write_data_to_file(kd->filename, kd->sync_on_write, key, NULL, timestamp) != 0) {
+    casky_errno = CASKY_ERR_IO;
+    return -1;
   }
-  casky_errno = CASKY_ERR_KEY_NOT_FOUND;
-  return -1;
+
+  casky_errno = CASKY_OK;
+  return 0;
 
 }
 
@@ -274,5 +340,5 @@ int    casky_delete(KeyDir *kd, const char *key) {
  * @return const char* - the version string, e.g., "0.10.0"
  */
 const char* casky_version(void) {
-    return CASKY_VERSION_STRING;
+  return CASKY_VERSION_STRING;
 }

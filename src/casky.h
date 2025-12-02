@@ -26,6 +26,10 @@ typedef struct KeyDir {
     size_t num_entries; // total num of keys
     size_t num_buckets; // total num of items in root array
     EntryNode **root;   // the directory root
+    char *filename;     // path to the log file
+    int sync_on_write;  // if set to 1 forces an fsync on *every* write on
+                        // disk. Useful for maximum resilience but it has
+                        // impact on performances
 } KeyDir;
 
 typedef enum {

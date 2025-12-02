@@ -1,5 +1,11 @@
+#include <stdio.h>
+#include <time.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 #include <sys/stat.h>
 #include "casky.h"
+#include "crc.h"
 /**
  * Checks whether the given path refers to a regular file.
  *
@@ -69,4 +75,177 @@ unsigned long casky_djb2_hash_xor(unsigned char *str)
     }
 
     return hash;
+}
+
+/**
+ * casky_write_data_to_file
+ *
+ * Writes a key/value record to the append-only log file.
+ * 
+ * Record format (Bitcask style):
+ *  - PUT:    [CRC32][Timestamp][Key Length][Value Length][Key][Value]
+ *  - DELETE: [CRC32][Timestamp][Key Length][0][Key]
+ *
+ * Parameters:
+ *  - logfile: path to the log file
+ *  - sync_on_write: if non-zero, forces an fsync() after writing to ensure
+ *                   crash-resilient persistence
+ *  - key: the key to store or delete
+ *  - value: the value to store; NULL if this is a DELETE record
+ *
+ * Returns:
+ *  - 0 on success
+ *  - -1 on error (errno set in casky_errno)
+ *
+ * Notes:
+ *  - Calculates CRC32 over the record (excluding the CRC field itself)
+ *  - Allocates a temporary buffer for CRC calculation
+ *  - Writes in binary append mode
+ */
+int casky_write_data_to_file(const char *logfile, int sync_on_write, const char *key, const char *value, uint32_t timestamp) {
+
+  // PUT  record: [CRC][Timestamp][KeyLen][ValueLen][Key][Value]
+  // DELETE record: [CRC][Timestamp][KeyLen][0][Key]
+
+  FILE *f = fopen(logfile, "ab");       // apri in append-binary
+  if (!f) {
+    casky_errno =  CASKY_ERR_INVALID_PATH;
+    return -1;
+  }
+
+  if (!key) {
+    // value string can be NULL in case of DELETE
+    casky_errno = CASKY_ERR_INVALID_POINTER;
+    return -1;
+  }
+
+  uint32_t key_len   = strlen(key);
+  uint32_t value_len = value ? strlen(value) : 0;
+
+  size_t buf_len = sizeof(timestamp) + sizeof(key_len) + sizeof(value_len) + key_len + value_len;
+  unsigned char *buf = malloc(buf_len);
+  if (!buf) {
+    fclose(f);
+    casky_errno = CASKY_ERR_MEMORY;
+    return -1;
+  }
+
+  unsigned char *p = buf;
+  memcpy(p, &timestamp, sizeof(timestamp)); p += sizeof(timestamp);
+  memcpy(p, &key_len, sizeof(key_len)); p += sizeof(key_len);
+  memcpy(p, &value_len, sizeof(value_len)); p += sizeof(value_len);
+  memcpy(p, key, key_len); p += key_len;
+  if (value)
+    memcpy(p, value, value_len);
+
+  uint32_t crc = casky_crc32(buf, buf_len);
+  free(buf);
+
+  fwrite(&crc, sizeof(crc), 1, f);
+  fwrite(&timestamp, sizeof(timestamp), 1, f);
+  fwrite(&key_len, sizeof(key_len), 1, f);
+  fwrite(&value_len, sizeof(value_len), 1, f);
+  fwrite(key, 1, key_len, f);
+  if (value_len > 0)
+    fwrite(value, 1, value_len, f);
+
+  fflush(f);
+  if (sync_on_write == 1)
+    fsync(fileno(f));
+  fclose(f);
+
+  return 0;
+}
+/**
+ * Inserts or updates a key-value pair **in memory** (KeyDir only),
+ * without writing to the log file. Used internally when loading
+ * the database from disk.
+ *
+ * If the key exists, updates the value and timestamp.
+ * If the key does not exist, appends a new EntryNode in the correct bucket.
+ *
+ * @param kd        Pointer to KeyDir
+ * @param key       Key string (null-terminated)
+ * @param value     Value string (null-terminated)
+ * @param timestamp Optional timestamp to set (e.g., from log)
+ */
+void casky_put_in_memory(KeyDir *kd, const char *key, const char *value, uint32_t timestamp) {
+    if (!kd || !key || !value) return;
+
+    unsigned long hash = casky_djb2_hash_xor((unsigned char*)key);
+    size_t bucket_index = hash % kd->num_buckets;
+
+    EntryNode *node = kd->root[bucket_index];
+    EntryNode *prev = NULL;
+
+    while (node) {
+        if (strcmp(key, node->entry.key) == 0) {
+            // update existing value
+            free(node->entry.value);
+            node->entry.value = strdup(value);
+            node->entry.timestamp = timestamp;
+            return;
+        }
+        prev = node;
+        node = node->next;
+    }
+
+    // key not found → create new node
+    EntryNode *new_node = calloc(1, sizeof(EntryNode));
+    new_node->entry.key = strdup(key);
+    new_node->entry.value = strdup(value);
+    new_node->entry.timestamp = timestamp;
+    new_node->next = NULL;
+
+    if (!prev) {
+        // empty bucket
+        kd->root[bucket_index] = new_node;
+    } else {
+        prev->next = new_node;
+    }
+
+    kd->num_entries++;
+}
+
+/**
+ * Deletes a key from memory (KeyDir only), without writing to the log file.
+ * Used internally when replaying DELETE records from the log.
+ *
+ * If the key is not found, does nothing.
+ *
+ * @param kd  Pointer to KeyDir
+ * @param key Key string to delete
+ *  @return 1 if the key was found and deleted, 0 otherwise
+ */
+int casky_delete_from_memory(KeyDir *kd, const char *key) {
+    if (!kd || !key)
+        return 0;
+
+    unsigned long hash = casky_djb2_hash_xor((unsigned char *)key);
+    size_t bucket_index = hash % kd->num_buckets;
+
+    EntryNode *node = kd->root[bucket_index];
+    EntryNode *prev = NULL;
+
+    while (node) {
+        if (strcmp(node->entry.key, key) == 0) {
+            // Found the key, remove it
+            if (prev == NULL) {
+                kd->root[bucket_index] = node->next;
+            } else {
+                prev->next = node->next;
+            }
+
+            free(node->entry.key);
+            free(node->entry.value);
+            free(node);
+
+            kd->num_entries--;
+            return 1; // key was found and deleted
+        }
+        prev = node;
+        node = node->next;
+    }
+
+    return 0; // key not found
 }

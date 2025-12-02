@@ -10,8 +10,12 @@ RM = rm -rf
 # --------------------------
 # Source Files
 # --------------------------
-SRC = src/casky.c src/utils.c
+SRC = src/casky.c src/utils.c src/crc.c
 OBJ = $(patsubst src/%.c,build/%.o,$(SRC))
+
+SERVER_SRC = src/caskyd.c
+SERVER_OBJ = $(BUILD_DIR)/caskyd.o
+SERVER_BIN = $(BUILD_DIR)/caskyd
 
 # --------------------------
 # Output Files
@@ -22,10 +26,13 @@ DYNAMIC_LIB = $(BUILD_DIR)/libcasky.so
 TEST_SRC = tests/test_casky.c
 TEST_BIN = $(BUILD_DIR)/test_casky
 
+LOGDUMP_SRC = src/casky_logdump.c
+LOGDUMP_BIN = $(BUILD_DIR)/casky_logdump
+
 # --------------------------
 # Targets
 # --------------------------
-all: $(STATIC_LIB) $(DYNAMIC_LIB) $(TEST_BIN)
+all: $(STATIC_LIB) $(DYNAMIC_LIB) $(TEST_BIN) $(SERVER_BIN) $(LOGDUMP_BIN)
 
 # Ensure build directory exists
 $(BUILD_DIR):
@@ -43,9 +50,18 @@ $(STATIC_LIB): $(OBJ)
 $(DYNAMIC_LIB): $(OBJ)
 	$(CC) -shared -o $@ $^
 
+# -----------------------------
+# Server binary
+# -----------------------------
+$(SERVER_BIN): $(SERVER_SRC) $(STATIC_LIB)
+	$(CC) $(CFLAGS) $(SERVER_SRC) $(STATIC_LIB) -o $(SERVER_BIN)
+
 # Build test executable
 $(TEST_BIN): $(TEST_SRC) $(STATIC_LIB) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(STATIC_LIB)
+
+$(LOGDUMP_BIN): $(LOGDUMP_SRC) $(STATIC_LIB) | $(BUILD)
+	$(CC) $(CFLAGS) $(LOGDUMP_SRC) $(STATIC_LIB) -o $(LOGDUMP_BIN)
 
 # Run tests
 test: $(TEST_BIN)
