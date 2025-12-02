@@ -30,6 +30,8 @@ typedef struct KeyDir {
     int sync_on_write;  // if set to 1 forces an fsync on *every* write on
                         // disk. Useful for maximum resilience but it has
                         // impact on performances
+    int corrupted_dir;  // if set to 1 casky_open() found a corrupted entry and
+                        // a COMPACT operation is suggested
 } KeyDir;
 
 typedef enum {
@@ -46,11 +48,12 @@ typedef enum {
 extern CaskyError casky_errno;
 
 KeyDir* casky_open(const char *path);
-void   casky_close(KeyDir *kd);
+void    casky_close(KeyDir *kd);
 
-int    casky_put(KeyDir *kd, const char *key, const char *value);
-char*  casky_get(KeyDir *kd, const char *key);
-int    casky_delete(KeyDir *kd, const char *key);
+int     casky_put(KeyDir *kd, const char *key, const char *value);
+char*   casky_get(KeyDir *kd, const char *key);
+int     casky_delete(KeyDir *kd, const char *key);
+int     casky_compact(KeyDir *kd);
 
 const char* casky_version(void);
 #endif

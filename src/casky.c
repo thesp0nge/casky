@@ -2,6 +2,8 @@
 #include <stdlib.h>
 #include <time.h>
 #include <string.h>
+#include <limits.h>
+#include <unistd.h>
 #include "casky.h"
 #include "crc.h"
 #include "utils.h"
@@ -10,17 +12,35 @@
 CaskyError casky_errno = CASKY_OK;
 
 /**
- * Opens a Casky database.
+ * Opens a Bitcask-style log-structured key-value database.
  *
- * If the log file exists, reads all records and reconstructs the in-memory
- * KeyDir. Each record is verified with CRC32.
+ * - Loads the database from the given log file into memory.
+ * - Initializes a new KeyDir structure with buckets, number of entries, and filename.
+ * - Sets `sync_on_write` to 0 by default (can be enabled later for full fsync on each write).
+ * - Reads existing records from the file:
+ *     - For each record, validates the CRC.
+ *     - If a record is corrupted:
+ *         - Stops processing further records (Bitcask-style behavior).
+ *         - Sets kd->corrupted_dir = 1 to indicate a compact is recommended.
+ *         - Sets casky_errno = CASKY_ERR_CORRUPT.
+ *     - Otherwise, reconstructs the in-memory key directory:
+ *         - PUT records: inserted/updated via casky_put_in_memory().
+ *         - DELETE records: removed via casky_delete_from_memory().
+ * - Returns a pointer to the KeyDir structure on success, NULL on failure.
  *
- * If the log file does not exist, creates an empty KeyDir and prepares for
- * writes. The KeyDir keeps track of the number of entries, buckets, root list,
- * and the filename for persistence.
+ * Error codes (set in casky_errno):
+ * - CASKY_OK: successful open, all read records are valid.
+ * - CASKY_ERR_INVALID_PATH: file path is NULL or cannot be opened.
+ * - CASKY_ERR_MEMORY: memory allocation failure.
+ * - CASKY_ERR_CORRUPT: a corrupted record was encountered (database partially loaded).
  *
- * Returns a pointer to a newly allocated KeyDir on success, or NULL on error.
- * Sets casky_errno appropriately.
+ * Note:
+ * - After encountering the first corrupted record, all subsequent records in the log are ignored.
+ * - Users can call casky_compact() to remove corrupted records and reclaim a clean log file.
+ * - Even if corruption is detected, the returned KeyDir may contain valid entries read before the corruption.
+ *
+ * @param path Path to the log file.
+ * @return Pointer to KeyDir structure on success, NULL on failure.
  */
 KeyDir* casky_open(const char *path) {
   if (!path) {
@@ -33,10 +53,12 @@ KeyDir* casky_open(const char *path) {
     casky_errno = CASKY_ERR_MEMORY;
     return NULL;
   }
+  casky_errno = CASKY_OK;
 
 
   kd->num_entries = 0;
   kd->num_buckets = CASKY_INITIAL_BUCKETS_NUM;
+  kd->corrupted_dir = 0;
   kd->root = calloc(kd->num_buckets, sizeof(EntryNode *));
   if (!kd->root) {
     free(kd);
@@ -122,10 +144,14 @@ KeyDir* casky_open(const char *path) {
       free(buf);
 
       if (computed_crc != crc) {
-        // skip corrupted record
+        // when a corrupted record is found, accordingly to bitcask paper, it
+        // has been discarded and a COMPACT operation is suggested to remove
+        // corrupted records
         free(key);
         free(value);
-        continue;
+        casky_errno = CASKY_ERR_CORRUPT;
+        kd->corrupted_dir = 1;
+        break;
       }
     }
 
@@ -142,7 +168,6 @@ KeyDir* casky_open(const char *path) {
   }
 
   fclose(f);
-  casky_errno = CASKY_OK;
   return kd;
 }
 
@@ -342,3 +367,75 @@ int    casky_delete(KeyDir *kd, const char *key) {
 const char* casky_version(void) {
   return CASKY_VERSION_STRING;
 }
+
+/**
+ * casky_compact - Compacts the database by writing all valid in-memory records
+ *                  to a new temporary log file and replacing the original log.
+ *
+ * Parameters:
+ *   kd - pointer to KeyDir containing all valid records loaded from log
+ *
+ * Returns:
+ *   0 on success, -1 on failure (sets casky_errno)
+ *
+ * Notes:
+ *   - Only valid records in memory are written; corrupted records are discarded.
+ *   - The operation is atomic: first a temp file is written, then renamed.
+ */
+int casky_compact(KeyDir *kd) {
+  if (!kd || !kd->filename) {
+    casky_errno = CASKY_ERR_INVALID_POINTER;
+    return -1;
+  }
+  // Create a safe temporary file
+  char tmpfile_template[PATH_MAX];
+  snprintf(tmpfile_template, sizeof(tmpfile_template), "%s.XXXXXX", kd->filename);
+
+  int fd = mkstemp(tmpfile_template);
+  if (fd == -1) {
+    casky_errno = CASKY_ERR_IO;
+    return -1;
+  }
+
+  FILE *f = fdopen(fd, "wb");
+  if (!f) {
+    close(fd);
+    casky_errno = CASKY_ERR_IO;
+    return -1;
+  }
+
+  // Iterate all buckets and nodes to write current in-memory entries
+  for (size_t i = 0; i < kd->num_buckets; i++) {
+    EntryNode *node = kd->root[i];
+    while (node) {
+      // Append record to temp file
+      if (casky_write_data_to_file(tmpfile_template, kd->sync_on_write,
+                                   node->entry.key, node->entry.value,
+                                   node->entry.timestamp) != 0) {
+        fclose(f);
+        remove(tmpfile_template);
+        casky_errno = CASKY_ERR_IO;
+        return -1;
+      }
+      node = node->next;
+    }
+  }
+
+  fflush(f);
+  if (kd->sync_on_write)
+    fsync(fileno(f));
+  fclose(f);
+
+  // Atomically replace old log file with compacted temp file
+  if (rename(tmpfile_template, kd->filename) != 0) {
+    remove(tmpfile_template);
+    casky_errno = CASKY_ERR_IO;
+    return -1;
+  }
+
+  casky_errno = CASKY_OK;
+  return 0;
+
+
+}
+

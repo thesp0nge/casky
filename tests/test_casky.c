@@ -218,8 +218,9 @@ void test_log_integrity() {
 
   db = casky_open(logfile);
   // L'apertura deve segnalare errore di log corrotto
-  assert(db == NULL);
+  assert(db != NULL);
   assert(casky_errno == CASKY_ERR_CORRUPT);
+  assert(db->corrupted_dir == 1);
 
   printf("✔ test_log_integrity passed\n");
 }
@@ -244,6 +245,44 @@ void test_multiple_operations_persist() {
   printf("✔ test_multiple_operations_persist passed\n");
 }
 
+void test_compact_empty() {
+  const char *logfile = "empty.log";
+  remove(logfile);
+  KeyDir *db = casky_open(logfile);
+  assert(db != NULL);
+  int ret = casky_compact(db);
+  assert(ret == 0); // successo
+  casky_close(db);
+
+  FILE *f = fopen(logfile, "rb");
+  assert(f != NULL);
+  fseek(f, 0, SEEK_END);
+  assert(ftell(f) == 0); // logfile vuoto
+  fclose(f);
+  printf("✔ test_compact_empty passed\n");
+}
+
+void test_compact_clean() {
+    const char *logfile = "clean.log";
+    remove(logfile);
+    KeyDir *db = casky_open(logfile);
+    casky_put(db, "foo", "bar");
+    casky_put(db, "alice", "bob");
+    int ret = casky_compact(db);
+    assert(ret == 0);
+    casky_close(db);
+    
+    db = casky_open(logfile);
+    char *val = casky_get(db, "foo");
+    assert(val != NULL && strcmp(val, "bar") == 0);
+    free(val);
+    val = casky_get(db, "alice");
+    assert(val != NULL && strcmp(val, "bob") == 0);
+    free(val);
+    casky_close(db);
+    printf("✔ test_compact_clean passed\n");
+}
+
 // ------------------------ Main ------------------------
 int main(void) {
   const char *testfile = "testdb";
@@ -259,6 +298,10 @@ int main(void) {
   test_open_creates_or_reads_log();
   test_put_writes_log();
   test_delete_writes_log();
+
+  test_compact_empty();
+  test_compact_clean();
+
   test_log_integrity();
   test_multiple_operations_persist();
   if (remove(testfile) == 0) {
