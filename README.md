@@ -1,46 +1,107 @@
 # casky
 
-## Description
+Casky is a simple, high-performance, embeddable key-value store written in C,
+inspired by the Bitcask paper. It provides a log-structured architecture for
+fast writes and reads, with optional thread-safety and crash resilience.
 
-Casky is a lightweight, crash-safe key-value store written in C, designed for
-fast storage and retrieval of data with a minimal footprint. Built using
-Test-Driven Development (TDD), Casky ensures reliability while keeping the
-codebase clean and maintainable. It is inspired by Bitcask and aims to provide a
-simple, embeddable storage engine that can be integrated into microservices, IoT
-devices, and other C-based applications.
+## Features
 
-### Objectives:
+- **Log-structured storage**: all writes are appended to a file.
+- **In-memory key directory**: fast key lookup without scanning the log.
+- **Thread-safe API**: optional compile-time thread-safety using
+  `-DTHREAD_SAFE`.
+- **Crash recovery**: detects and handles corrupted log entries.
+- **Compaction**: removes corrupted or deleted entries from the log.
+- **Simple TCP server** (`caskyd`) with command-line protocol (`PUT`, `GET`,
+  `DEL`, `QUIT`).
+- Thread-safe API for `casky_put`, `casky_get`, `casky_delete`, and
+  `casky_compact` (`-DTHREAD_SAFE`).
+- Full TDD coverage: unit tests and integration tests.
+- Stress test for concurrent clients against `caskyd`.
+- Optional fsync on every write (`sync_on_write` flag).
+- Consistent CRC checks on all records with automatic marking of corrupted logs.
+- Caskyd server simplified to rely on API thread-safety instead of managing its
+  own locks.
+- Semantic versioning in changelog and release notes.
 
-- Implement a minimal key-value store with append-only file storage.
-- Support crash-safe persistence and recovery.
-- Expose a simple public API: store(key, value), load(key), delete(key).
-- Follow TDD methodology for robust and testable code.
-- Provide a foundation for future extensions, such as in-memory caching,
-  compaction, and eventual integration with vector-based databases like PixelDB.
+## Installation
 
-### Why This Project is Interesting:
+```bash
+git clone <repo_url>
+cd casky
+make
+```
 
-Casky combines low-level C programming with modern database concepts, making it
-an ideal playground to explore storage engines, crash safety, and performance
-optimization. It’s small enough to complete during Hackweek, yet it provides a
-solid base for future experiments and more complex projects.
+To build with thread-safe API:
 
-## Goals
+```sh
+make CFLAGS="-DTHREAD_SAFE" all
+```
 
-- Working prototype with append-only storage and memtable.
-- TDD test suite covering core functionality and recovery.
-- Demonstration of basic operations: insert, load, delete.
-- Optional bonus: LRU caching, file compaction, performance benchmarks.
+## Usage
 
-### Future Directions:
+### Using the library
 
-After Hackweek, Casky can evolve into a backend engine for projects like
-PixelDB, supporting vector storage and approximate nearest neighbor search,
-combining low-level performance with cutting-edge AI retrieval applications.
+```c
+#include "casky.h"
 
-## Resources
+KeyDir *db = casky_open("mydb.log");
+casky_put(db, "key1", "value1");
+char *v = casky_get(db, "key1");
+casky_delete(db, "key1");
+casky_compact(db);
+casky_close(db);
+free(v);
 
-The Bitcask paper:
-[https://riak.com/assets/bitcask-intro.pdf](https://riak.com/assets/bitcask-intro.pdf)
-The Casky repository:
-[https://github.com/thesp0nge/casky](https://github.com/thesp0nge/casky)
+```
+
+### Using the server (caskyd)
+
+```sh
+./build/caskyd
+```
+
+Clients can connect via TCP and issue commands:
+
+```sh
+PUT <key> <value>
+GET <key>
+DEL <key>
+QUIT
+```
+
+Responses:
+
+- OK on successful PUT or DEL
+- VALUE <value> on GET
+- NOT_FOUND if key does not exist
+- ERROR <code> for errors
+
+## Tests
+
+Run all tests:
+
+```sh
+make test
+```
+
+- test_casky – unit tests for the library
+- test_caskyd – server command tests
+- test_stress_caskyd – multi-threaded stress test (requires -DTHREAD_SAFE)
+
+## Thread-Safety
+
+Compile-time flag -DTHREAD_SAFE enables mutex protection around all operations
+(put, get, delete, compact).
+
+If not enabled, the library behaves according to the original Bitcask paper:
+single-threaded access only.
+
+## Logging
+
+caskyd provides optional logging with different levels (INFO, DEBUG, ERROR)
+controllable via environment variables.
+
+## License
+
+MIT License (see LICENSE.md for details)

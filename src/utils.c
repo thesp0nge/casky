@@ -249,3 +249,42 @@ int casky_delete_from_memory(KeyDir *kd, const char *key) {
 
     return 0; // key not found
 }
+
+/**
+ * casky_get_from_memory - Core function to retrieve a value from the in-memory KeyDir
+ * @kd: pointer to the KeyDir structure
+ * @key: key to look up
+ *
+ * This function searches the in-memory hash table for the given key and returns
+ * a dynamically allocated copy of its value if found. It does NOT perform any
+ * locking and is therefore NOT thread-safe. Use casky_get() if you need thread
+ * safety (it wraps this core function with a mutex when compiled with -DTHREAD_SAFE).
+ *
+ * Return: strdup'ed value on success, NULL on error (sets casky_errno)
+ */
+char* casky_get_from_memory(KeyDir *kd, const char *key) {
+    if (!kd) {
+        casky_errno = CASKY_ERR_INVALID_POINTER;
+        return NULL;
+    }
+    if (!key) {
+        casky_errno = CASKY_ERR_INVALID_KEY;
+        return NULL;
+    }
+
+    unsigned long hash = casky_djb2_hash_xor((unsigned char *)key);
+    size_t bucket_index = hash % kd->num_buckets;
+
+    EntryNode *node = kd->root[bucket_index];
+    while (node) {
+        if (strcmp(key, node->entry.key) == 0) {
+            casky_errno = CASKY_OK;
+            return strdup(node->entry.value);
+        }
+        node = node->next;
+    }
+
+    casky_errno = CASKY_ERR_KEY_NOT_FOUND;
+    return NULL;
+}
+

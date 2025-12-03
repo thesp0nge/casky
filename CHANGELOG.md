@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.30.0] – 2025-12-03
+
+### Added
+
+- Compile-time thread-safety flag -DTHREAD_SAFE:
+- Enables concurrent access to casky_put, casky_get, casky_delete, and
+  casky_compact.
+- Without the flag, APIs behave according to the original Bitcask paper
+  (non-thread-safe).
+- Server caskyd now relies on the library for thread-safety instead of managing
+  locks internally.
+- Stress test test_stress_caskyd added to verify multi-client concurrency (only
+  active with -DTHREAD_SAFE).
+- Comments in the code documenting the architecture choice for optional
+  thread-safety.
+
+### Changed
+
+- casky_put, casky_get, casky_delete, and casky_compact now internally handle
+  locking when THREAD_SAFE is defined.
+- caskyd handles multiple clients via pthreads without managing locks itself.
+- Logging and client welcome messages standardized.
+- Improved error handling (casky_errno) for corrupted logs and invalid commands.
+
+### Fixed
+
+- Bug in stress tests caused by unexpected server welcome message.
+- Compatibility fix for usleep() function across platforms.
+- Corrected behavior when corrupted log records are detected; casky_errno now
+  properly set.
+
 ## [0.20.0] - 2025-12-02
 
 ### Added

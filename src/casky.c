@@ -9,6 +9,18 @@
 #include "utils.h"
 #include "version.h"
 
+#ifdef THREAD_SAFE
+#include <pthread.h>
+#endif
+
+#ifdef THREAD_SAFE
+#define LOCK(kd)   pthread_mutex_lock(&(kd)->lock)
+#define UNLOCK(kd) pthread_mutex_unlock(&(kd)->lock)
+#else
+#define LOCK(kd)
+#define UNLOCK(kd)
+#endif
+
 CaskyError casky_errno = CASKY_OK;
 
 /**
@@ -59,6 +71,7 @@ KeyDir* casky_open(const char *path) {
   kd->num_entries = 0;
   kd->num_buckets = CASKY_INITIAL_BUCKETS_NUM;
   kd->corrupted_dir = 0;
+  pthread_mutex_init(&kd->lock, NULL);
   kd->root = calloc(kd->num_buckets, sizeof(EntryNode *));
   if (!kd->root) {
     free(kd);
@@ -202,6 +215,7 @@ void casky_close(KeyDir *kd) {
       node = next;
     }
   }
+  pthread_mutex_destroy(&kd->lock);
   free(kd->root);
   free(kd);
 
@@ -245,14 +259,17 @@ int casky_put(KeyDir *kd, const char *key, const char *value) {
     return -1;
   }
 
+  LOCK(kd);
   uint32_t timestamp = time(NULL);
   casky_put_in_memory(kd, key, value, timestamp);
 
   // Write record to log file
   if (casky_write_data_to_file(kd->filename, kd->sync_on_write, key, value, timestamp) != 0) {
     casky_errno = CASKY_ERR_IO;
+    UNLOCK(kd);
     return -1;
   }
+    UNLOCK(kd);
 
   casky_errno = CASKY_OK;
   return 0;
@@ -288,21 +305,11 @@ char*  casky_get(KeyDir *kd, const char *key){
     casky_errno = CASKY_ERR_INVALID_KEY;
     return NULL;
   }
-  unsigned long hash = casky_djb2_hash_xor((unsigned char *)key);
-  size_t bucket_index = hash % kd->num_buckets;
+  LOCK(kd);
+  char *value = casky_get_from_memory(kd, key);
+  UNLOCK(kd);
 
-  EntryNode *node = kd->root[bucket_index];
-  while (node) {
-    if (strcmp(key, node->entry.key) == 0) {
-      casky_errno = CASKY_OK;
-      return strdup(node->entry.value);
-    }
-    node = node->next;
-  }
-
-  casky_errno = CASKY_ERR_KEY_NOT_FOUND;
-  return NULL;
-
+  return value;
 }
 
 /**
@@ -335,6 +342,7 @@ int    casky_delete(KeyDir *kd, const char *key) {
     return -1;
   }
 
+  LOCK(kd);
   // Remove from memory
   int found = casky_delete_from_memory(kd, key);
   if (!found) {
@@ -347,8 +355,10 @@ int    casky_delete(KeyDir *kd, const char *key) {
   // Append deletion record to log file (value = NULL)
   if (casky_write_data_to_file(kd->filename, kd->sync_on_write, key, NULL, timestamp) != 0) {
     casky_errno = CASKY_ERR_IO;
+    UNLOCK(kd);
     return -1;
   }
+  UNLOCK(kd);
 
   casky_errno = CASKY_OK;
   return 0;
@@ -387,6 +397,7 @@ int casky_compact(KeyDir *kd) {
     casky_errno = CASKY_ERR_INVALID_POINTER;
     return -1;
   }
+  LOCK(kd);
   // Create a safe temporary file
   char tmpfile_template[PATH_MAX];
   snprintf(tmpfile_template, sizeof(tmpfile_template), "%s.XXXXXX", kd->filename);
@@ -394,6 +405,7 @@ int casky_compact(KeyDir *kd) {
   int fd = mkstemp(tmpfile_template);
   if (fd == -1) {
     casky_errno = CASKY_ERR_IO;
+    UNLOCK(kd);
     return -1;
   }
 
@@ -401,6 +413,7 @@ int casky_compact(KeyDir *kd) {
   if (!f) {
     close(fd);
     casky_errno = CASKY_ERR_IO;
+    UNLOCK(kd);
     return -1;
   }
 
@@ -430,9 +443,11 @@ int casky_compact(KeyDir *kd) {
   if (rename(tmpfile_template, kd->filename) != 0) {
     remove(tmpfile_template);
     casky_errno = CASKY_ERR_IO;
+    UNLOCK(kd);
     return -1;
   }
 
+  UNLOCK(kd);
   casky_errno = CASKY_OK;
   return 0;
 

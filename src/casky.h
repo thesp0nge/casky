@@ -6,6 +6,31 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/**
+ * Thread-safety and compile-time configuration
+ *
+ * Casky API is designed to be lightweight and adhere closely to the original
+ * Bitcask paper by default. In this mode, there is no internal locking, and
+ * concurrent access to the same KeyDir structure from multiple threads must
+ * be managed externally by the caller.
+ *
+ * To provide optional thread-safety, a compile-time flag THREAD_SAFE can be
+ * defined (-DTHREAD_SAFE). When enabled:
+ *   - All API functions (casky_put, casky_get, casky_delete, casky_compact)
+ *     acquire a mutex internally before accessing the KeyDir memory structure
+ *     or writing to the log file.
+ *   - This ensures safe concurrent access across multiple threads within the
+ *     same process.
+ *   - Performance overhead is minimal when THREAD_SAFE is disabled.
+ *
+ * This approach gives users the flexibility to choose between:
+ *   1) strict Bitcask compatibility (no locks, maximum throughput), or
+ *   2) a resilient, thread-safe API suitable for multithreaded applications.
+ */
+#ifdef THREAD_SAFE
+#include <pthread.h>
+#endif
+
 #include "version.h"
 
 
@@ -23,15 +48,18 @@ typedef struct EntryNode {
 } EntryNode;
 
 typedef struct KeyDir {
-    size_t num_entries; // total num of keys
-    size_t num_buckets; // total num of items in root array
-    EntryNode **root;   // the directory root
-    char *filename;     // path to the log file
-    int sync_on_write;  // if set to 1 forces an fsync on *every* write on
-                        // disk. Useful for maximum resilience but it has
-                        // impact on performances
-    int corrupted_dir;  // if set to 1 casky_open() found a corrupted entry and
-                        // a COMPACT operation is suggested
+    size_t num_entries;   // total num of keys
+    size_t num_buckets;   // total num of items in root array
+    EntryNode **root;     // the directory root
+    char *filename;       // path to the log file
+    int sync_on_write;    // if set to 1 forces an fsync on *every* write on
+                          // disk. Useful for maximum resilience but it has
+                          // impact on performances
+    int corrupted_dir;    // if set to 1 casky_open() found a corrupted entry and
+                          // a COMPACT operation is suggested
+#ifdef THREAD_SAFE
+    pthread_mutex_t lock; // mutex for thread-safe access
+#endif
 } KeyDir;
 
 typedef enum {
