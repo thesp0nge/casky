@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.40.0] - 2025-12-04
+
+### Added
+
+- TTL (time-to-live) support for keys in memory
+- Key expiration cleanup routine (`casky_expire`)
+- Server-side commands implemented:
+  - COMPACT: compacts log file
+  - STAT: retrieves runtime statistics
+  - VER: returns Casky version
+
 ## [0.30.0] – 2025-12-03
 
 ### Added

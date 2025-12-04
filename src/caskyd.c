@@ -153,7 +153,7 @@ static void *handle_client(void *arg) {
       if (n < 3) {
         fprintf(client, "ERROR usage: PUT <key> <value>\n");
       } else {
-        int ret = casky_put(db, key, value);
+        int ret = casky_put(db, key, value, 0);
         if (ret == 0) {
           fprintf(client, "OK\n");
           log_msg(LOG_DEBUG, "PUT key='%s' ok", key);
@@ -162,6 +162,7 @@ static void *handle_client(void *arg) {
           log_msg(LOG_WARN, "PUT key='%s' failed err=%d", key, casky_errno);
         }
       }
+
     }
     else if (strcasecmp(cmd, "GET") == 0) {
       if (n < 2) {

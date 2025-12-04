@@ -9,14 +9,6 @@
 #include "utils.h"
 #include "version.h"
 
-#ifdef THREAD_SAFE
-#include <pthread.h>
-#define LOCK(kd)   pthread_mutex_lock(&(kd)->lock)
-#define UNLOCK(kd) pthread_mutex_unlock(&(kd)->lock)
-#else
-#define LOCK(kd)
-#define UNLOCK(kd)
-#endif
 
 
 CaskyError casky_errno = CASKY_OK;
@@ -56,6 +48,11 @@ KeyDir* casky_open(const char *path) {
   if (!path) {
     casky_errno = CASKY_ERR_INVALID_PATH;
     return NULL;
+  }
+  static int initialized = 0;
+  if (!initialized) {
+    casky_stats_init();
+    initialized = 1;
   }
 
   KeyDir *kd = malloc(sizeof(KeyDir));
@@ -108,10 +105,12 @@ KeyDir* casky_open(const char *path) {
   rewind(f);
 
   while (!feof(f)) {
-    uint32_t crc, timestamp, key_len, value_len;
+    uint32_t crc, key_len, value_len;
+    uint64_t timestamp, expires;
 
     if (fread(&crc, sizeof(crc), 1, f) != 1) break;
     if (fread(&timestamp, sizeof(timestamp), 1, f) != 1) break;
+    if (fread(&expires, sizeof(expires), 1, f) != 1) break;
     if (fread(&key_len, sizeof(key_len), 1, f) != 1) break;
     if (fread(&value_len, sizeof(value_len), 1, f) != 1) break;
 
@@ -141,11 +140,12 @@ KeyDir* casky_open(const char *path) {
     }
 
     // Verify CRC
-    size_t buf_len = sizeof(timestamp) + sizeof(key_len) + sizeof(value_len) + key_len + value_len;
+    size_t buf_len = sizeof(timestamp) + sizeof(expires) + sizeof(key_len) + sizeof(value_len) + key_len + value_len;
     unsigned char *buf = malloc(buf_len);
     if (buf) {
       unsigned char *p = buf;
       memcpy(p, &timestamp, sizeof(timestamp)); p += sizeof(timestamp);
+      memcpy(p, &expires, sizeof(expires)); p += sizeof(expires);
       memcpy(p, &key_len, sizeof(key_len)); p += sizeof(key_len);
       memcpy(p, &value_len, sizeof(value_len)); p += sizeof(value_len);
       memcpy(p, key, key_len); p += key_len;
@@ -165,15 +165,19 @@ KeyDir* casky_open(const char *path) {
         break;
       }
     }
-
+    if (expires > 0 && expires <= (uint64_t)time(NULL)) {
+      free(key);
+      free(value);
+    } else {
     if (value_len > 0) {
       // PUT record
-      casky_put_in_memory(kd, key, value, timestamp);
+      casky_put_in_memory(kd, key, value, timestamp, expires);
     } else {
       // DELETE record
       casky_delete_from_memory(kd, key);
     }
 
+    }
     free(key);
     free(value);
   }
@@ -237,9 +241,11 @@ void casky_close(KeyDir *kd) {
  *   - The bucket is determined by hashing the key with casky_djb2_hash_xor
  *     and taking the modulo with the number of buckets.
  *
- * @kd: Pointer to the KeyDir (hash table) where the key-value pair is stored
- * @key: Null-terminated string representing the key
+ * @kd:    Pointer to the KeyDir (hash table) where the key-value pair is stored
+ * @key:   Null-terminated string representing the key
  * @value: Null-terminated string representing the value
+ * @#ttl:  the time to live for this entry. If set to 0 than the record doesn't
+ *         expire.
  *
  * Returns:
  *   0 on success,
@@ -247,7 +253,7 @@ void casky_close(KeyDir *kd) {
  *
  * Sets casky_errno to reflect the operation result.
  */
-int casky_put(KeyDir *kd, const char *key, const char *value) {
+int casky_put(KeyDir *kd, const char *key, const char *value, uint32_t ttl) {
   if (!kd) {
     casky_errno = CASKY_ERR_INVALID_POINTER;
     return -1;
@@ -258,11 +264,12 @@ int casky_put(KeyDir *kd, const char *key, const char *value) {
   }
 
   LOCK(kd);
-  uint32_t timestamp = time(NULL);
-  casky_put_in_memory(kd, key, value, timestamp);
+  uint64_t timestamp = time(NULL);
+  uint64_t expires = (ttl>0) ? (uint64_t)time(NULL) + ttl : 0;
+  casky_put_in_memory(kd, key, value, timestamp, expires);
 
   // Write record to log file
-  if (casky_write_data_to_file(kd->filename, kd->sync_on_write, key, value, timestamp) != 0) {
+  if (casky_write_data_to_file(kd->filename, kd->sync_on_write, key, value, timestamp, expires) != 0) {
     casky_errno = CASKY_ERR_IO;
     UNLOCK(kd);
     return -1;
@@ -348,10 +355,10 @@ int    casky_delete(KeyDir *kd, const char *key) {
     return -1;
   }  
 
-  uint32_t timestamp = time(NULL);
+  uint64_t timestamp = time(NULL);
 
   // Append deletion record to log file (value = NULL)
-  if (casky_write_data_to_file(kd->filename, kd->sync_on_write, key, NULL, timestamp) != 0) {
+  if (casky_write_data_to_file(kd->filename, kd->sync_on_write, key, NULL, timestamp, 0) != 0) {
     casky_errno = CASKY_ERR_IO;
     UNLOCK(kd);
     return -1;
@@ -422,7 +429,8 @@ int casky_compact(KeyDir *kd) {
       // Append record to temp file
       if (casky_write_data_to_file(tmpfile_template, kd->sync_on_write,
                                    node->entry.key, node->entry.value,
-                                   node->entry.timestamp) != 0) {
+                                   node->entry.timestamp,
+                                   node->entry.expiration_ts) != 0) {
         fclose(f);
         remove(tmpfile_template);
         casky_errno = CASKY_ERR_IO;
@@ -448,6 +456,49 @@ int casky_compact(KeyDir *kd) {
   UNLOCK(kd);
   casky_errno = CASKY_OK;
   return 0;
+}
 
 
+void casky_expire(KeyDir *kd) {
+  if (!kd) {
+    casky_errno = CASKY_ERR_INVALID_POINTER;
+    return ;
+  }
+  uint64_t now = (uint64_t)time(NULL);
+
+  LOCK(kd);
+
+  for (size_t i = 0; i < kd->num_buckets; i++) {
+    EntryNode *prev = NULL;
+    EntryNode *node = kd->root[i];
+
+    while (node) {
+      if (node->entry.expiration_ts > 0 &&
+        node->entry.expiration_ts <= now) {
+
+        EntryNode *next = node->next;
+
+        if (prev)
+          prev->next = next;
+        else
+          kd->root[i] = next;
+
+        casky_stats_inc_delete(strlen(node->entry.key) + strlen(node->entry.value));
+
+        kd->num_entries--;
+
+        free(node->entry.key);
+        free(node->entry.value);
+        free(node);
+
+        // Continua con il prossimo
+        node = next;
+      } else {
+        prev = node;
+        node = node->next;
+      }
+    }
+  }
+
+  UNLOCK(kd);
 }

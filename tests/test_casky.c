@@ -5,7 +5,34 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
+#ifdef THREAD_SAFE
+#include <pthread.h>
+#define LOCK(kd)   pthread_mutex_lock(&(kd)->lock)
+#define UNLOCK(kd) pthread_mutex_unlock(&(kd)->lock)
+#else
+#define LOCK(kd)
+#define UNLOCK(kd)
+#endif
+
+void simulate_all_expired(KeyDir *kd) {
+  uint64_t now = time(NULL);
+
+  LOCK(kd);
+  for (size_t i = 0; i < kd->num_buckets; i++) {
+    EntryNode *e = kd->root[i];
+    while (e) {
+      printf("Simulating bucket %zu\n", i);
+      printf("Key=%s, exp=%llu\n", e->entry.key, (unsigned long long)e->entry.expiration_ts);
+      if (e->entry.expiration_ts > 0 || e->entry.expiration_ts > now) {
+        e->entry.expiration_ts = now - 1; // scade subito
+      }
+      e = e->next;
+    }
+  }
+  UNLOCK(kd);
+}
 // ------------------------ Test Open/Close ------------------------
 void test_open_close(const char *file) {
   remove(file);
@@ -39,15 +66,15 @@ void test_hashes() {
 // ------------------------ Test PUT ------------------------
 void test_put() {
   KeyDir *db = casky_open("testdb");
-  assert(casky_put(db, "foo", "bar") == 0);
+  assert(casky_put(db, "foo", "bar", 0) == 0);
   assert(db->num_entries == 1);
 
   // Overwrite
-  assert(casky_put(db, "foo", "baz") == 0);
+  assert(casky_put(db, "foo", "baz", 0) == 0);
   assert(db->num_entries == 1);
 
   // Altra chiave
-  assert(casky_put(db, "alice", "bob") == 0);
+  assert(casky_put(db, "alice", "bob", 0) == 0);
   assert(db->num_entries == 2);
 
   casky_close(db);
@@ -57,8 +84,8 @@ void test_put() {
 // ------------------------ Test GET ------------------------
 void test_get() {
   KeyDir *db = casky_open("testdb");
-  casky_put(db, "foo", "bar");
-  casky_put(db, "alice", "bob");
+  casky_put(db, "foo", "bar", 0);
+  casky_put(db, "alice", "bob", 0);
 
   char *val = casky_get(db, "foo");
   assert(val != NULL && strcmp(val, "bar") == 0);
@@ -85,8 +112,8 @@ void test_get() {
 void test_delete() {
   remove("testdb");
   KeyDir *db = casky_open("testdb");
-  casky_put(db, "foo", "bar");
-  casky_put(db, "alice", "bob");
+  casky_put(db, "foo", "bar", 0);
+  casky_put(db, "alice", "bob", 0);
 
   assert(casky_delete(db, "foo") == 0);
   char *val = casky_get(db, "foo");
@@ -124,9 +151,9 @@ void test_collisions() {
 
   // For simplicity, force keys into same bucket by using same hash mod
   // (here we assume small bucket size for demonstration)
-  casky_put(db, "a", "1");
-  casky_put(db, "b", "2");
-  casky_put(db, "c", "3");
+  casky_put(db, "a", "1", 0);
+  casky_put(db, "b", "2", 0);
+  casky_put(db, "c", "3", 0);
 
   assert(db->num_entries == 3);
 
@@ -165,7 +192,7 @@ void test_put_writes_log() {
   KeyDir *db = casky_open(logfile);
   assert(db != NULL);
 
-  int ret = casky_put(db, "foo", "bar");
+  int ret = casky_put(db, "foo", "bar", 0);
   assert(ret == 0);
   assert(db->num_entries == 1);
 
@@ -185,7 +212,7 @@ void test_delete_writes_log() {
   remove(logfile);
 
   KeyDir *db = casky_open(logfile);
-  casky_put(db, "foo", "bar");
+  casky_put(db, "foo", "bar", 0);
 
   int ret = casky_delete(db, "foo");
   assert(ret == 0);
@@ -207,7 +234,7 @@ void test_log_integrity() {
   remove(logfile);
 
   KeyDir *db = casky_open(logfile);
-  casky_put(db, "foo", "bar");
+  casky_put(db, "foo", "bar", 0);
   casky_close(db);
 
   // Simula corruzione
@@ -230,10 +257,10 @@ void test_multiple_operations_persist() {
   remove(logfile);
 
   KeyDir *db = casky_open(logfile);
-  casky_put(db, "foo", "bar");
-  casky_put(db, "alice", "bob");
+  casky_put(db, "foo", "bar", 0);
+  casky_put(db, "alice", "bob", 0);
   casky_delete(db, "foo");
-  casky_put(db, "carol", "dan");
+  casky_put(db, "carol", "dan", 0);
   casky_close(db);
 
   db = casky_open(logfile);
@@ -263,24 +290,45 @@ void test_compact_empty() {
 }
 
 void test_compact_clean() {
-    const char *logfile = "clean.log";
-    remove(logfile);
-    KeyDir *db = casky_open(logfile);
-    casky_put(db, "foo", "bar");
-    casky_put(db, "alice", "bob");
-    int ret = casky_compact(db);
-    assert(ret == 0);
-    casky_close(db);
-    
-    db = casky_open(logfile);
-    char *val = casky_get(db, "foo");
-    assert(val != NULL && strcmp(val, "bar") == 0);
-    free(val);
-    val = casky_get(db, "alice");
-    assert(val != NULL && strcmp(val, "bob") == 0);
-    free(val);
-    casky_close(db);
-    printf("✔ test_compact_clean passed\n");
+  const char *logfile = "clean.log";
+  remove(logfile);
+  KeyDir *db = casky_open(logfile);
+  casky_put(db, "foo", "bar", 0);
+  casky_put(db, "alice", "bob", 0);
+  int ret = casky_compact(db);
+  assert(ret == 0);
+  casky_close(db);
+
+  db = casky_open(logfile);
+  char *val = casky_get(db, "foo");
+  assert(val != NULL && strcmp(val, "bar") == 0);
+  free(val);
+  val = casky_get(db, "alice");
+  assert(val != NULL && strcmp(val, "bob") == 0);
+  free(val);
+  casky_close(db);
+  printf("✔ test_compact_clean passed\n");
+}
+
+void test_ttl_simulation() {
+  casky_stats_init();
+  casky_stat_t stats;
+  const char *logfile = "ttl_clean.log";
+  remove(logfile);
+  KeyDir *db = casky_open(logfile);
+
+  casky_put(db, "short_lived", "abc", 1);
+  casky_put(db, "long_lived", "xyz", 0);
+
+  sleep(5);
+
+  assert(casky_get(db, "short_lived") == NULL); 
+  assert(casky_get(db, "long_lived") != NULL);  
+
+  simulate_all_expired(db);
+  casky_expire(db);
+  stats = casky_stats_get();
+  assert(stats.total_keys == 1);
 }
 
 // ------------------------ Main ------------------------
@@ -301,6 +349,8 @@ int main(void) {
 
   test_compact_empty();
   test_compact_clean();
+
+  test_ttl_simulation();
 
   test_log_integrity();
   test_multiple_operations_persist();

@@ -1,10 +1,20 @@
 #ifndef __CASKY_H
 #define __CASKY_H
 
+
 #define CASKY_INITIAL_BUCKETS_NUM   1024
 
 #include <stddef.h>
 #include <stdint.h>
+
+#ifdef THREAD_SAFE
+#include <pthread.h>
+#define LOCK(kd)   pthread_mutex_lock(&(kd)->lock)
+#define UNLOCK(kd) pthread_mutex_unlock(&(kd)->lock)
+#else
+#define LOCK(kd)
+#define UNLOCK(kd)
+#endif
 
 /**
  * Thread-safety and compile-time configuration
@@ -38,6 +48,12 @@ typedef struct Entry {
     char *key;
     char *value;
     uint64_t timestamp;
+    // This is the entry time to live. This is not part of the original bitcask
+    // paper, however it's a nice and modern feature to have the possibility to
+    // let a record to expire.
+    //
+    // Please note that if set to 0, the record doesn't expire at all.
+    uint64_t expiration_ts;
 } Entry;
 
 typedef struct EntryNode {
@@ -77,10 +93,11 @@ extern CaskyError casky_errno;
 KeyDir* casky_open(const char *path);
 void    casky_close(KeyDir *kd);
 
-int     casky_put(KeyDir *kd, const char *key, const char *value);
+int     casky_put(KeyDir *kd, const char *key, const char *value, uint32_t ttl);
 char*   casky_get(KeyDir *kd, const char *key);
 int     casky_delete(KeyDir *kd, const char *key);
 int     casky_compact(KeyDir *kd);
+void    casky_expire(KeyDir *kd);
 
 const char*        casky_version(void);
 #endif
