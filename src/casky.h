@@ -73,6 +73,7 @@ typedef enum {
     CASKY_ERR_KEY_NOT_FOUND,
 } CaskyError;
 
+
 extern CaskyError casky_errno;
 
 KeyDir* casky_open(const char *path);
@@ -83,6 +84,6 @@ char*   casky_get(KeyDir *kd, const char *key);
 int     casky_delete(KeyDir *kd, const char *key);
 int     casky_compact(KeyDir *kd);
 
-const char* casky_version(void);
+const char*        casky_version(void);
 #endif
 

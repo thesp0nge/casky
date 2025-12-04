@@ -11,15 +11,13 @@
 
 #ifdef THREAD_SAFE
 #include <pthread.h>
-#endif
-
-#ifdef THREAD_SAFE
 #define LOCK(kd)   pthread_mutex_lock(&(kd)->lock)
 #define UNLOCK(kd) pthread_mutex_unlock(&(kd)->lock)
 #else
 #define LOCK(kd)
 #define UNLOCK(kd)
 #endif
+
 
 CaskyError casky_errno = CASKY_OK;
 
@@ -453,4 +451,3 @@ int casky_compact(KeyDir *kd) {
 
 
 }
-

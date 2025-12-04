@@ -16,6 +16,8 @@
 #include <stdarg.h>
 #include <errno.h>
 #include "../src/casky.h"
+#include "../src/utils.h"
+#include "../src/version.h"
 
 #define CASKY_PORT 5050
 #define BUFFER_SIZE 4096
@@ -101,7 +103,7 @@ static void *handle_client(void *arg) {
   }
 
   char line[BUFFER_SIZE];
-#if defined(THREAD_SAFE)
+#ifdef THREAD_SAFE
   const char *ts = " (thread-safe)";
 #else
   const char *ts = "";
@@ -128,6 +130,16 @@ static void *handle_client(void *arg) {
 
     if (n <= 0) {
       fprintf(client, "ERROR invalid command\n");
+      fflush(client);
+      continue;
+    }
+    if (strcasecmp(cmd, "VER") == 0) {
+#ifdef THREAD_SAFE
+      const char *ts = "(thread-safe)";
+#else
+      const char *ts = "";
+#endif
+      fprintf(client, "%s %s\n", casky_version(), ts);
       fflush(client);
       continue;
     }
@@ -182,7 +194,7 @@ static void *handle_client(void *arg) {
     }
     else if (strcasecmp(cmd, "COMPACT") == 0) {
       /* expose compaction via server command */
-#if defined(THREAD_SAFE)
+#ifdef THREAD_SAFE
       log_msg(LOG_INFO, "COMPACT requested by client");
       int cret = casky_compact(db);
       if (cret == 0) fprintf(client, "OK\n");
@@ -192,9 +204,13 @@ static void *handle_client(void *arg) {
 #endif
     }
     else if (strcasecmp(cmd, "STATS") == 0) {
-      /* simple stats: num_entries and filename size */
-      size_t num = db ? db->num_entries : 0;
-      fprintf(client, "STATS entries=%zu\n", num);
+      casky_stat_t stats = casky_stats_get();
+      fprintf(client, "STATS\n total keys=%zu\n total gets=%zu\n total puts=%zu\n total deletes=%zu\n occupied memory=%zu\n", 
+              stats.total_keys,
+              stats.num_gets,
+              stats.num_puts,
+              stats.num_deletes,
+              stats.memory_bytes);
     }
     else {
       fprintf(client, "ERROR unknown command\n");
@@ -262,7 +278,7 @@ int main(void) {
     return EXIT_FAILURE;
   }
 
-#if defined(THREAD_SAFE)
+#ifdef THREAD_SAFE
   log_msg(LOG_INFO, "caskyd listening on port %d (thread-safe build)", CASKY_PORT);
 #else
   log_msg(LOG_INFO, "caskyd listening on port %d (paper-compatible build)", CASKY_PORT);

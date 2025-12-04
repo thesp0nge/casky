@@ -6,6 +6,20 @@
 #include <sys/stat.h>
 #include "casky.h"
 #include "crc.h"
+#include "utils.h"
+
+static casky_stat_t casky_statistics;
+
+#ifdef THREAD_SAFE
+#include <pthread.h>
+#define LOCK_STATS(s) pthread_mutex_lock(&(s).lock)
+#define UNLOCK_STATS(s) pthread_mutex_unlock(&(s).lock)
+#else
+#define LOCK_STATS(s)
+#define UNLOCK_STATS(s)
+#endif
+
+
 /**
  * Checks whether the given path refers to a regular file.
  *
@@ -170,41 +184,46 @@ int casky_write_data_to_file(const char *logfile, int sync_on_write, const char 
  * @param timestamp Optional timestamp to set (e.g., from log)
  */
 void casky_put_in_memory(KeyDir *kd, const char *key, const char *value, uint32_t timestamp) {
-    if (!kd || !key || !value) return;
+  if (!kd || !key || !value) return;
 
-    unsigned long hash = casky_djb2_hash_xor((unsigned char*)key);
-    size_t bucket_index = hash % kd->num_buckets;
+  unsigned long hash = casky_djb2_hash_xor((unsigned char*)key);
+  size_t bucket_index = hash % kd->num_buckets;
 
-    EntryNode *node = kd->root[bucket_index];
-    EntryNode *prev = NULL;
+  EntryNode *node = kd->root[bucket_index];
+  EntryNode *prev = NULL;
 
-    while (node) {
-        if (strcmp(key, node->entry.key) == 0) {
-            // update existing value
-            free(node->entry.value);
-            node->entry.value = strdup(value);
-            node->entry.timestamp = timestamp;
-            return;
-        }
-        prev = node;
-        node = node->next;
+  while (node) {
+    if (strcmp(key, node->entry.key) == 0) {
+      // update existing value
+      free(node->entry.value);
+      node->entry.value = strdup(value);
+      node->entry.timestamp = timestamp;
+
+      casky_stats_inc_put(strlen(node->entry.key) + strlen(node->entry.value));
+      return;
     }
+    prev = node;
+    node = node->next;
+  }
 
-    // key not found → create new node
-    EntryNode *new_node = calloc(1, sizeof(EntryNode));
-    new_node->entry.key = strdup(key);
-    new_node->entry.value = strdup(value);
-    new_node->entry.timestamp = timestamp;
-    new_node->next = NULL;
+  // key not found → create new node
+  EntryNode *new_node = calloc(1, sizeof(EntryNode));
+  new_node->entry.key = strdup(key);
+  new_node->entry.value = strdup(value);
+  new_node->entry.timestamp = timestamp;
+  new_node->next = NULL;
 
-    if (!prev) {
-        // empty bucket
-        kd->root[bucket_index] = new_node;
-    } else {
-        prev->next = new_node;
-    }
+  casky_stats_inc_entries();
+  casky_stats_inc_put(strlen(new_node->entry.key) + strlen(new_node->entry.value));
 
-    kd->num_entries++;
+  if (!prev) {
+    // empty bucket
+    kd->root[bucket_index] = new_node;
+  } else {
+    prev->next = new_node;
+  }
+
+  kd->num_entries++;
 }
 
 /**
@@ -218,36 +237,38 @@ void casky_put_in_memory(KeyDir *kd, const char *key, const char *value, uint32_
  *  @return 1 if the key was found and deleted, 0 otherwise
  */
 int casky_delete_from_memory(KeyDir *kd, const char *key) {
-    if (!kd || !key)
-        return 0;
+  if (!kd || !key)
+    return 0;
 
-    unsigned long hash = casky_djb2_hash_xor((unsigned char *)key);
-    size_t bucket_index = hash % kd->num_buckets;
+  unsigned long hash = casky_djb2_hash_xor((unsigned char *)key);
+  size_t bucket_index = hash % kd->num_buckets;
 
-    EntryNode *node = kd->root[bucket_index];
-    EntryNode *prev = NULL;
+  EntryNode *node = kd->root[bucket_index];
+  EntryNode *prev = NULL;
 
-    while (node) {
-        if (strcmp(node->entry.key, key) == 0) {
-            // Found the key, remove it
-            if (prev == NULL) {
-                kd->root[bucket_index] = node->next;
-            } else {
-                prev->next = node->next;
-            }
+  while (node) {
+    if (strcmp(node->entry.key, key) == 0) {
+      // Found the key, remove it
+      if (prev == NULL) {
+        kd->root[bucket_index] = node->next;
+      } else {
+        prev->next = node->next;
+      }
+      casky_stats_inc_delete(strlen(node->entry.key) + strlen(node->entry.value));
+      casky_stats_dec_entries();
 
-            free(node->entry.key);
-            free(node->entry.value);
-            free(node);
+      free(node->entry.key);
+      free(node->entry.value);
+      free(node);
 
-            kd->num_entries--;
-            return 1; // key was found and deleted
-        }
-        prev = node;
-        node = node->next;
+      kd->num_entries--;
+      return 1; // key was found and deleted
     }
+    prev = node;
+    node = node->next;
+  }
 
-    return 0; // key not found
+  return 0; // key not found
 }
 
 /**
@@ -263,28 +284,85 @@ int casky_delete_from_memory(KeyDir *kd, const char *key) {
  * Return: strdup'ed value on success, NULL on error (sets casky_errno)
  */
 char* casky_get_from_memory(KeyDir *kd, const char *key) {
-    if (!kd) {
-        casky_errno = CASKY_ERR_INVALID_POINTER;
-        return NULL;
-    }
-    if (!key) {
-        casky_errno = CASKY_ERR_INVALID_KEY;
-        return NULL;
-    }
-
-    unsigned long hash = casky_djb2_hash_xor((unsigned char *)key);
-    size_t bucket_index = hash % kd->num_buckets;
-
-    EntryNode *node = kd->root[bucket_index];
-    while (node) {
-        if (strcmp(key, node->entry.key) == 0) {
-            casky_errno = CASKY_OK;
-            return strdup(node->entry.value);
-        }
-        node = node->next;
-    }
-
-    casky_errno = CASKY_ERR_KEY_NOT_FOUND;
+  if (!kd) {
+    casky_errno = CASKY_ERR_INVALID_POINTER;
     return NULL;
+  }
+  if (!key) {
+    casky_errno = CASKY_ERR_INVALID_KEY;
+    return NULL;
+  }
+
+  unsigned long hash = casky_djb2_hash_xor((unsigned char *)key);
+  size_t bucket_index = hash % kd->num_buckets;
+
+  EntryNode *node = kd->root[bucket_index];
+  while (node) {
+    if (strcmp(key, node->entry.key) == 0) {
+      casky_errno = CASKY_OK;
+      casky_stats_inc_get();
+      return strdup(node->entry.value);
+    }
+    node = node->next;
+  }
+
+  casky_errno = CASKY_ERR_KEY_NOT_FOUND;
+  return NULL;
 }
 
+// STAT utility routines
+/**
+ * Initialize a casky_stat_t structure.
+ * Sets all counters to zero and initializes the mutex if thread-safety is enabled.
+ *
+ * Parameters:
+ *  - stats: pointer to the casky_stat_t structure to initialize 
+ */
+void casky_stats_init() {
+  LOCK_STATS(casky_statistics);
+  casky_statistics.total_keys = 0;
+  casky_statistics.memory_bytes = 0;
+  casky_statistics.num_puts = 0;
+  casky_statistics.num_gets = 0;
+  casky_statistics.num_deletes = 0;
+  UNLOCK_STATS(casky_statistics);
+  
+}
+
+void casky_stats_inc_put(size_t bytes) {
+  LOCK_STATS(casky_statistics);
+  casky_statistics.num_puts++;
+  casky_statistics.memory_bytes += bytes;
+  UNLOCK_STATS(casky_statistics);
+}
+
+void casky_stats_inc_delete(size_t bytes) {
+  LOCK_STATS(casky_statistics);
+  casky_statistics.num_deletes++;
+  if (bytes > 0 && casky_statistics.memory_bytes >= bytes)
+    casky_statistics.memory_bytes -= bytes;
+  UNLOCK_STATS(casky_statistics);
+}
+casky_stat_t casky_stats_get(void) {
+  LOCK_STATS(casky_statistics);
+  casky_stat_t copy;
+  copy = casky_statistics;
+  UNLOCK_STATS(casky_statistics);
+  return copy;
+}
+void casky_stats_inc_entries(void) {
+  LOCK_STATS(casky_statistics);
+  casky_statistics.total_keys++;
+  UNLOCK_STATS(casky_statistics);
+}
+void casky_stats_dec_entries(void) {
+  LOCK_STATS(casky_statistics);
+  if (casky_statistics.total_keys > 0)
+    casky_statistics.total_keys--;
+  UNLOCK_STATS(casky_statistics);
+}
+void casky_stats_inc_get(void) {
+  LOCK_STATS(casky_statistics);
+  casky_statistics.num_gets++;
+  UNLOCK_STATS(casky_statistics);
+}
