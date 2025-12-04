@@ -91,6 +91,8 @@ test: $(TEST_BIN) $(TEST_DAEMON_BIN) $(TEST_STRESS_DAEMON_BIN)
 # Clean all build artifacts
 clean:
 	$(RM) $(BUILD_DIR)
+	$(RM) *.log
+	$(RM) caskyd.db
 
 .PHONY: all clean test
 

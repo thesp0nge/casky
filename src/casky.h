@@ -38,8 +38,6 @@ typedef struct Entry {
     char *key;
     char *value;
     uint64_t timestamp;
-    long offset;
-    size_t value_size;
 } Entry;
 
 typedef struct EntryNode {
