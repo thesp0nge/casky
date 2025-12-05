@@ -101,7 +101,8 @@ unsigned long casky_djb2_hash_xor(unsigned char *str)
  *  - DELETE: [CRC][Timestamp][ExpirationTs][KeyLen][0][Key]
  *
  * Parameters:
- *  - logfile: path to the log file
+ *  - fp: the FILE handle. Closing the file will be up to the callee function
+ *  when checking for a bad result
  *  - sync_on_write: if non-zero, forces an fsync() after writing to ensure
  *                   crash-resilient persistence
  *  - key: the key to store or delete
@@ -116,15 +117,14 @@ unsigned long casky_djb2_hash_xor(unsigned char *str)
  *  - Allocates a temporary buffer for CRC calculation
  *  - Writes in binary append mode
  */
-int casky_write_data_to_file(const char *logfile, int sync_on_write, 
+int casky_write_data_to_file(FILE *fp, int sync_on_write, 
                              const char *key, const char *value, 
                              uint64_t timestamp, uint64_t expires) {
 
-  // PUT  record: [CRC][Timestamp][KeyLen][ValueLen][Key][Value]
-  // DELETE record: [CRC][Timestamp][KeyLen][0][Key]
+  // PUT  record: [CRC][Timestamp][Expires][KeyLen][ValueLen][Key][Value]
+  // DELETE record: [CRC][Timestamp][Expires][KeyLen][0][Key]
 
-  FILE *f = fopen(logfile, "ab");       // apri in append-binary
-  if (!f) {
+  if (!fp) {
     casky_errno =  CASKY_ERR_INVALID_PATH;
     return -1;
   }
@@ -141,7 +141,6 @@ int casky_write_data_to_file(const char *logfile, int sync_on_write,
   size_t buf_len = sizeof(timestamp) + sizeof(expires) + sizeof(key_len) + sizeof(value_len) + key_len + value_len;
   unsigned char *buf = malloc(buf_len);
   if (!buf) {
-    fclose(f);
     casky_errno = CASKY_ERR_MEMORY;
     return -1;
   }
@@ -158,19 +157,18 @@ int casky_write_data_to_file(const char *logfile, int sync_on_write,
   uint32_t crc = casky_crc32(buf, buf_len);
   free(buf);
 
-  fwrite(&crc, sizeof(crc), 1, f);
-  fwrite(&timestamp, sizeof(timestamp), 1, f);
-  fwrite(&expires, sizeof(expires), 1, f);
-  fwrite(&key_len, sizeof(key_len), 1, f);
-  fwrite(&value_len, sizeof(value_len), 1, f);
-  fwrite(key, 1, key_len, f);
+  fwrite(&crc, sizeof(crc), 1, fp);
+  fwrite(&timestamp, sizeof(timestamp), 1, fp);
+  fwrite(&expires, sizeof(expires), 1, fp);
+  fwrite(&key_len, sizeof(key_len), 1, fp);
+  fwrite(&value_len, sizeof(value_len), 1, fp);
+  fwrite(key, 1, key_len, fp);
   if (value_len > 0)
-    fwrite(value, 1, value_len, f);
+    fwrite(value, 1, value_len, fp);
 
-  fflush(f);
+  fflush(fp);
   if (sync_on_write == 1)
-    fsync(fileno(f));
-  fclose(f);
+    fsync(fileno(fp));
 
   return 0;
 }
@@ -383,4 +381,59 @@ void casky_stats_inc_get(void) {
   LOCK_STATS(casky_statistics);
   casky_statistics.num_gets++;
   UNLOCK_STATS(casky_statistics);
+}
+
+void casky_flush_log(KeyDir *kd) {
+  if (!kd || !kd->log) return;
+  fflush(kd->log);
+  if (kd->sync_on_write)
+    fsync(fileno(kd->log));
+}
+
+// HANDLING SNAPSHOT
+
+int casky_do_snapshot(KeyDir *kd, const char *snapshot_file) {
+  if (!kd) {
+    casky_errno = CASKY_ERR_INVALID_POINTER;
+    return -1;
+  }
+  if (!snapshot_file) {
+    casky_errno = CASKY_ERR_INVALID_PATH;
+    return -1;
+  }
+  FILE *f = fopen(snapshot_file, "wb");
+  if (!f) {
+    fclose(f);
+    casky_errno = CASKY_ERR_IO;
+    UNLOCK(kd);
+    return -1;
+  }
+
+  LOCK(kd);
+  for (size_t i = 0; i < kd->num_buckets; i++) {
+    EntryNode *node = kd->root[i];
+    while (node) {
+      if (node->entry.expiration_ts == 0 || node->entry.expiration_ts > (uint64_t)time(NULL)) {
+        if (casky_write_data_to_file(f, kd->sync_on_write,
+                                     node->entry.key, node->entry.value,
+                                     node->entry.timestamp,
+                                     node->entry.expiration_ts) != 0) {
+          fclose(f);
+          casky_errno = CASKY_ERR_IO;
+          UNLOCK(kd);
+          return -1;
+        }
+      }
+      node = node->next;
+    }
+  }
+  fflush(f);
+  if (kd->sync_on_write) fsync(fileno(f));
+  fclose(f);
+  UNLOCK(kd);
+  casky_errno = CASKY_OK;
+  return 0;
+}
+KeyDir *casky_load_snapshot(const char *snapshot_file) {
+  return casky_init_kd_from_file(snapshot_file, 0);
 }

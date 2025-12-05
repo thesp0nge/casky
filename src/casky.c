@@ -13,6 +13,113 @@
 
 CaskyError casky_errno = CASKY_OK;
 
+KeyDir *casky_init_kd_from_file(const char *file, int open_log) {
+  if (!file) {
+    casky_errno = CASKY_ERR_INVALID_PATH;
+    return NULL;
+  }
+
+  FILE *f = fopen(file, "rb");  // prova ad aprire in lettura
+  if (!f && open_log) {
+    // File inesistente? crea un file vuoto
+    f = fopen(file, "wb");
+    if (!f) {
+      casky_errno = CASKY_ERR_IO;
+      return NULL;
+    }
+    fclose(f);
+    f = fopen(file, "rb");
+  }
+
+  KeyDir *kd = calloc(1, sizeof(KeyDir));
+  if (!kd) {
+    if (f) fclose(f);
+    casky_errno = CASKY_ERR_MEMORY;
+    return NULL;
+  }
+
+  kd->num_buckets = CASKY_INITIAL_BUCKETS_NUM;
+  kd->root = calloc(kd->num_buckets, sizeof(EntryNode*));
+  if (!kd->root) {
+    free(kd);
+    if (f) fclose(f);
+    casky_errno = CASKY_ERR_MEMORY;
+    return NULL;
+  }
+
+  kd->log = NULL;
+  kd->sync_on_write = open_log ? 1 : 0;  // default sync for main log
+  kd->filename = strdup(file); 
+  if (!kd->filename) {
+    casky_errno = CASKY_ERR_MEMORY;
+    free(kd);
+    return NULL;
+  }
+#ifdef THREAD_SAFE
+  pthread_mutex_init(&kd->lock, NULL);
+#endif
+
+  // Load existing entries
+  if (f) {
+    while (!feof(f)) {
+      uint32_t crc, key_len, value_len;
+      uint64_t timestamp, expires;
+
+      if (fread(&crc, sizeof(crc), 1, f) != 1) break;
+      if (fread(&timestamp, sizeof(timestamp), 1, f) != 1) break;
+      if (fread(&expires, sizeof(expires), 1, f) != 1) break;
+      if (fread(&key_len, sizeof(key_len), 1, f) != 1) break;
+      if (fread(&value_len, sizeof(value_len), 1, f) != 1) break;
+
+      char *key = malloc(key_len + 1);
+      char *value = malloc(value_len + 1);
+      if (!key || (!value && value_len > 0)) { free(key); free(value); break; }
+
+      if (fread(key, 1, key_len, f) != key_len) { free(key); free(value); break; }
+      key[key_len] = '\0';
+      if (value_len > 0) {
+        if (fread(value, 1, value_len, f) != value_len) { free(key); free(value); break; }
+        value[value_len] = '\0';
+      } else {
+        free(value);
+        value = NULL;
+      }
+
+      // Only load valid (non-expired) entries
+      if (value_len == 0) {
+        // DELETE record → non inserire nulla in memoria
+        casky_delete_from_memory(kd, key);
+      } else if (expires == 0 || expires > (uint64_t)time(NULL)) {
+        // PUT record non scaduto → inserisci o aggiorna
+        casky_put_in_memory(kd, key, value, timestamp, expires);
+      }
+
+      free(key);
+      if (value) free(value);
+    }
+    fclose(f);
+  }
+
+  // Open the log for further writes (casky_put)
+  if (open_log) {
+    FILE *log_fp = fopen(file, "ab+");
+    if (!log_fp) {
+      // Se non esiste, crealo
+      log_fp = fopen(file, "wb+");
+      if (!log_fp) {
+        free(kd->root);
+        free(kd);
+        casky_errno = CASKY_ERR_IO;
+        return NULL;
+      }
+    }
+    kd->log = log_fp;
+  }
+
+  casky_errno = CASKY_OK;
+  return kd;
+}
+
 /**
  * Opens a Bitcask-style log-structured key-value database.
  *
@@ -45,145 +152,12 @@ CaskyError casky_errno = CASKY_OK;
  * @return Pointer to KeyDir structure on success, NULL on failure.
  */
 KeyDir* casky_open(const char *path) {
-  if (!path) {
-    casky_errno = CASKY_ERR_INVALID_PATH;
-    return NULL;
-  }
   static int initialized = 0;
   if (!initialized) {
     casky_stats_init();
     initialized = 1;
   }
-
-  KeyDir *kd = malloc(sizeof(KeyDir));
-  if (!kd) {
-    casky_errno = CASKY_ERR_MEMORY;
-    return NULL;
-  }
-  casky_errno = CASKY_OK;
-
-
-  kd->num_entries = 0;
-  kd->num_buckets = CASKY_INITIAL_BUCKETS_NUM;
-  kd->corrupted_dir = 0;
-  pthread_mutex_init(&kd->lock, NULL);
-  kd->root = calloc(kd->num_buckets, sizeof(EntryNode *));
-  if (!kd->root) {
-    free(kd);
-    casky_errno = CASKY_ERR_MEMORY;
-    return NULL;
-  }
-
-  kd->filename = strdup(path);
-  if (!kd->filename) {
-    free(kd->root);
-    free(kd);
-    casky_errno = CASKY_ERR_MEMORY;
-    return NULL;
-  }
-
-  /**
-   * This flag enables or disables a fsync call in casky_write_data_to_file()
-   * If set to 1 on every fflush() after a disk operation, a fsync() is
-   * performed to ensure data is really pushed out from OS buffers. This have
-   * performance impact but it maximizes the crash tolerance.
-   *
-   * Default: no fsync, preserve performances
-   */
-
-  kd->sync_on_write = 0;
-  FILE *f = fopen(path, "ab+");
-  if (!f) {
-    free(kd->filename);
-    free(kd->root);
-    free(kd);
-    casky_errno = CASKY_ERR_INVALID_PATH;
-    return NULL;
-  }
-
-  // Rewind to start for reading existing records
-  rewind(f);
-
-  while (!feof(f)) {
-    uint32_t crc, key_len, value_len;
-    uint64_t timestamp, expires;
-
-    if (fread(&crc, sizeof(crc), 1, f) != 1) break;
-    if (fread(&timestamp, sizeof(timestamp), 1, f) != 1) break;
-    if (fread(&expires, sizeof(expires), 1, f) != 1) break;
-    if (fread(&key_len, sizeof(key_len), 1, f) != 1) break;
-    if (fread(&value_len, sizeof(value_len), 1, f) != 1) break;
-
-    char *key = malloc(key_len + 1);
-    char *value = value_len > 0 ? malloc(value_len + 1) : NULL;
-
-    if (!key || (value_len > 0 && !value)) {
-      free(key);
-      free(value);
-      continue; // skip invalid record
-    }
-
-    if (fread(key, 1, key_len, f) != key_len) {
-      free(key);
-      free(value);
-      break;
-    }
-    key[key_len] = '\0';
-
-    if (value_len > 0) {
-      if (fread(value, 1, value_len, f) != value_len) {
-        free(key);
-        free(value);
-        break;
-      }
-      value[value_len] = '\0';
-    }
-
-    // Verify CRC
-    size_t buf_len = sizeof(timestamp) + sizeof(expires) + sizeof(key_len) + sizeof(value_len) + key_len + value_len;
-    unsigned char *buf = malloc(buf_len);
-    if (buf) {
-      unsigned char *p = buf;
-      memcpy(p, &timestamp, sizeof(timestamp)); p += sizeof(timestamp);
-      memcpy(p, &expires, sizeof(expires)); p += sizeof(expires);
-      memcpy(p, &key_len, sizeof(key_len)); p += sizeof(key_len);
-      memcpy(p, &value_len, sizeof(value_len)); p += sizeof(value_len);
-      memcpy(p, key, key_len); p += key_len;
-      if (value_len > 0) memcpy(p, value, value_len);
-
-      uint32_t computed_crc = casky_crc32(buf, buf_len);
-      free(buf);
-
-      if (computed_crc != crc) {
-        // when a corrupted record is found, accordingly to bitcask paper, it
-        // has been discarded and a COMPACT operation is suggested to remove
-        // corrupted records
-        free(key);
-        free(value);
-        casky_errno = CASKY_ERR_CORRUPT;
-        kd->corrupted_dir = 1;
-        break;
-      }
-    }
-    if (expires > 0 && expires <= (uint64_t)time(NULL)) {
-      free(key);
-      free(value);
-    } else {
-    if (value_len > 0) {
-      // PUT record
-      casky_put_in_memory(kd, key, value, timestamp, expires);
-    } else {
-      // DELETE record
-      casky_delete_from_memory(kd, key);
-    }
-
-    }
-    free(key);
-    free(value);
-  }
-
-  fclose(f);
-  return kd;
+  return casky_init_kd_from_file(path, 1);
 }
 
 /**
@@ -217,8 +191,13 @@ void casky_close(KeyDir *kd) {
       node = next;
     }
   }
+#ifdef THREAD_SAFE
   pthread_mutex_destroy(&kd->lock);
+#endif
+  casky_flush_log(kd);
+  fclose(kd->log);
   free(kd->root);
+  if (kd->filename) free(kd->filename);
   free(kd);
 
   casky_errno = CASKY_OK;
@@ -269,12 +248,12 @@ int casky_put(KeyDir *kd, const char *key, const char *value, uint32_t ttl) {
   casky_put_in_memory(kd, key, value, timestamp, expires);
 
   // Write record to log file
-  if (casky_write_data_to_file(kd->filename, kd->sync_on_write, key, value, timestamp, expires) != 0) {
+  if (casky_write_data_to_file(kd->log, kd->sync_on_write, key, value, timestamp, expires) != 0) {
     casky_errno = CASKY_ERR_IO;
     UNLOCK(kd);
     return -1;
   }
-    UNLOCK(kd);
+  UNLOCK(kd);
 
   casky_errno = CASKY_OK;
   return 0;
@@ -358,7 +337,7 @@ int    casky_delete(KeyDir *kd, const char *key) {
   uint64_t timestamp = time(NULL);
 
   // Append deletion record to log file (value = NULL)
-  if (casky_write_data_to_file(kd->filename, kd->sync_on_write, key, NULL, timestamp, 0) != 0) {
+  if (casky_write_data_to_file(kd->log, kd->sync_on_write, key, NULL, timestamp, 0) != 0) {
     casky_errno = CASKY_ERR_IO;
     UNLOCK(kd);
     return -1;
@@ -423,25 +402,27 @@ int casky_compact(KeyDir *kd) {
   }
 
   // Iterate all buckets and nodes to write current in-memory entries
-  for (size_t i = 0; i < kd->num_buckets; i++) {
-    EntryNode *node = kd->root[i];
-    while (node) {
-      // Append record to temp file
-      if (casky_write_data_to_file(tmpfile_template, kd->sync_on_write,
-                                   node->entry.key, node->entry.value,
-                                   node->entry.timestamp,
-                                   node->entry.expiration_ts) != 0) {
-        fclose(f);
-        remove(tmpfile_template);
-        casky_errno = CASKY_ERR_IO;
-        return -1;
+  if (kd->root && kd->num_entries > 0) {
+    for (size_t i = 0; i < kd->num_buckets; i++) {
+      EntryNode *node = kd->root[i];
+      while (node) {
+        // Append record to temp file
+        if (casky_write_data_to_file(f, kd->sync_on_write,
+                                     node->entry.key, node->entry.value,
+                                     node->entry.timestamp,
+                                     node->entry.expiration_ts) != 0) {
+          fclose(f);
+          remove(tmpfile_template);
+          casky_errno = CASKY_ERR_IO;
+          UNLOCK(kd);
+          return -1;
+        }
+        node = node->next;
       }
-      node = node->next;
     }
   }
-
   fflush(f);
-  if (kd->sync_on_write)
+  if (kd->sync_on_write) 
     fsync(fileno(f));
   fclose(f);
 
@@ -453,6 +434,7 @@ int casky_compact(KeyDir *kd) {
     return -1;
   }
 
+  kd->log = fopen(kd->filename, "ab+");
   UNLOCK(kd);
   casky_errno = CASKY_OK;
   return 0;

@@ -4,6 +4,7 @@
 
 #define CASKY_INITIAL_BUCKETS_NUM   1024
 
+#include <stdio.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -66,6 +67,7 @@ typedef struct KeyDir {
     size_t num_buckets;   // total num of items in root array
     EntryNode **root;     // the directory root
     char *filename;       // path to the log file
+    FILE *log;            // the log file handler
     int sync_on_write;    // if set to 1 forces an fsync on *every* write on
                           // disk. Useful for maximum resilience but it has
                           // impact on performances
@@ -90,6 +92,7 @@ typedef enum {
 
 extern CaskyError casky_errno;
 
+KeyDir *casky_init_kd_from_file(const char *file, int open_log);
 KeyDir* casky_open(const char *path);
 void    casky_close(KeyDir *kd);
 

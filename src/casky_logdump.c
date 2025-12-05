@@ -20,10 +20,12 @@ int main(int argc, char **argv) {
     printf("Debug log file: %s\n", logfile);
 
     while (1) {
-        uint32_t crc_stored, timestamp, key_len, value_len;
+        uint32_t crc_stored, key_len, value_len;
+    uint64_t timestamp, expires;
 
         if (fread(&crc_stored, sizeof(crc_stored), 1, f) != 1) break;
         if (fread(&timestamp, sizeof(timestamp), 1, f) != 1) break;
+        if (fread(&expires, sizeof(expires), 1, f) != 1) break;
         if (fread(&key_len, sizeof(key_len), 1, f) != 1) break;
         if (fread(&value_len, sizeof(value_len), 1, f) != 1) break;
 
@@ -41,10 +43,11 @@ int main(int argc, char **argv) {
         }
 
         // compute CRC over [timestamp][key_len][value_len][key][value]
-        size_t buf_len = sizeof(timestamp) + sizeof(key_len) + sizeof(value_len) + key_len + value_len;
+        size_t buf_len = sizeof(timestamp) + +sizeof(expires) + sizeof(key_len) + sizeof(value_len) + key_len + value_len;
         unsigned char *buf = malloc(buf_len);
         unsigned char *p = buf;
         memcpy(p, &timestamp, sizeof(timestamp)); p += sizeof(timestamp);
+        memcpy(p, &expires, sizeof(expires)); p += sizeof(expires);
         memcpy(p, &key_len, sizeof(key_len)); p += sizeof(key_len);
         memcpy(p, &value_len, sizeof(value_len)); p += sizeof(value_len);
         memcpy(p, key, key_len); p += key_len;
@@ -53,12 +56,15 @@ int main(int argc, char **argv) {
         uint32_t crc_calc = casky_crc32(buf, buf_len);
         free(buf);
 
-        printf("Record: CRC=0x%08X%s, TS=%u, Key='%s', Value='%s'\n",
+        printf("Record: CRC=0x%08X%s, TS=%lu, EX=%lu, Key='%s', Value='%s'\n",
                crc_stored,
                (crc_stored != crc_calc) ? " [CRC MISMATCH]" : "",
                timestamp,
+               expires,
                key,
                value);
+    if (crc_stored != crc_calc) 
+      printf("Expected 0x%08X, Found: 0x%08X\n", crc_stored, crc_calc);
 
         free(key);
         free(value);

@@ -214,14 +214,15 @@ void test_delete_writes_log() {
   KeyDir *db = casky_open(logfile);
   casky_put(db, "foo", "bar", 0);
 
-  int ret = casky_delete(db, "foo");
-  assert(ret == 0);
-  assert(db->num_entries == 0);
+int ret = casky_delete(db, "foo");
+assert(ret == 0);
+assert(db->num_entries == 0);
 
   // Riapri → chiave non deve esistere
   casky_close(db);
   db = casky_open(logfile);
   char *val = casky_get(db, "foo");
+  printf("|%s|%p|\n", val,&val);
   assert(val == NULL);
   assert(casky_errno == CASKY_ERR_KEY_NOT_FOUND);
 
@@ -276,6 +277,7 @@ void test_compact_empty() {
   const char *logfile = "empty.log";
   remove(logfile);
   KeyDir *db = casky_open(logfile);
+  printf("%s\n", db->filename);
   assert(db != NULL);
   int ret = casky_compact(db);
   assert(ret == 0); // successo

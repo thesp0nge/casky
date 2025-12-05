@@ -39,6 +39,9 @@ TEST_DAEMON_BIN = $(BUILD_DIR)/test_caskyd
 TEST_STRESS_DAEMON_SRC = tests/test_stress_caskyd.c
 TEST_STRESS_DAEMON_BIN = $(BUILD_DIR)/test_stress_caskyd
 
+TEST_BACKUP_SRC = tests/test_backup_and_snapshot.c
+TEST_BACKUP_BIN= $(BUILD_DIR)/test_backup_and_snapshot
+
 LOGDUMP_SRC = src/casky_logdump.c
 LOGDUMP_BIN = $(BUILD_DIR)/casky_logdump
 
@@ -79,14 +82,18 @@ $(TEST_DAEMON_BIN): $(TEST_DAEMON_SRC) $(STATIC_LIB) | $(BUILD_DIR)
 $(TEST_STRESS_DAEMON_BIN): $(TEST_STRESS_DAEMON_SRC) $(STATIC_LIB) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -o $@ $(TEST_STRESS_DAEMON_SRC) $(STATIC_LIB)
 
+$(TEST_BACKUP_BIN): $(TEST_BACKUP_SRC) $(STATIC_LIB) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $@ $(TEST_BACKUP_SRC) $(STATIC_LIB)
+
 $(LOGDUMP_BIN): $(LOGDUMP_SRC) $(STATIC_LIB) | $(BUILD)
 	$(CC) $(CFLAGS) $(LOGDUMP_SRC) $(STATIC_LIB) -o $(LOGDUMP_BIN)
 
 # Run tests
-test: $(TEST_BIN) $(TEST_DAEMON_BIN) $(TEST_STRESS_DAEMON_BIN)
+test: $(TEST_BIN) $(TEST_DAEMON_BIN) $(TEST_STRESS_DAEMON_BIN) $(TEST_BACKUP_BIN)
 	./$(TEST_BIN)
 	./$(TEST_DAEMON_BIN)
 	./$(TEST_STRESS_DAEMON_BIN)
+	./$(TEST_BACKUP_BIN)
 
 # Clean all build artifacts
 clean:
